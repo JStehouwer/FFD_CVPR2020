@@ -9,7 +9,7 @@ Provided is code that demonstrates the training and evaluation of the work prese
 
 See the MSU CVLab website for project details and access to the DFFD dataset.
 
-http://cvlab.msu.edu/project-ffd.html
+http://cvlab.cse.msu.edu/project-ffd.html
 
 ### Notes
 
