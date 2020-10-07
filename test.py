@@ -1,157 +1,121 @@
-import argparse
 import numpy as np
 import os
+import random
+from scipy.io import savemat
+import shutil
+from tensorboardX import SummaryWriter
 import torch
+import torch.optim as optim
 import torch.nn as nn
-from imageio import imread
-from network.xception import xception
-from network.vgg import vgg16
-from torchvision import transforms
-import torchvision.utils as vutils
-from torch.utils.data import DataLoader
-from sklearn.metrics import accuracy_score, roc_auc_score, auc
-from sklearn import metrics
-import matplotlib.pyplot as plt
-import pickle
+
+from dataset import Dataset
+from templates import get_templates
+
+MODEL_DIR = './models/'
+BACKBONE = 'xcp'
+MAPTYPE = 'reg'
+BATCH_SIZE = 200
+MAX_EPOCHS = 100
+LEARNING_RATE = 0.0001
+WEIGHT_DECAY = 0.001
+
+CONFIGS = {
+  'xcp': {
+          'img_size': (299, 299),
+          'map_size': (19, 19),
+          'norms': [[0.5] * 3, [0.5] * 3]
+         },
+  'vgg': {
+          'img_size': (299, 299),
+          'map_size': (19, 19),
+          'norms': [[0.485, 0.456, 0.406], [0.229, 0.224, 0.225]]
+         }
+}
+CONFIG = CONFIGS[BACKBONE]
+
+if BACKBONE == 'xcp':
+  from xception import Model
+elif BACKBONE == 'vgg':
+  from vgg import Model
+
 torch.backends.deterministic = True
+SEED = 1
+random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--gpu', type=int, default=0)
-parser.add_argument('--batch_size', type=int, default=64, help='batch size')
-parser.add_argument('--seed', default=1, type=int, help='manual seed')
-parser.add_argument('--data_dir', help='root directory for data')
-parser.add_argument('--save_dir', default='./runs', help='directory for result')
-parser.add_argument('--modeldir', help='model in pickle file to test')
-opt = parser.parse_args()
-print(opt)
+def get_dataset():
+  return Dataset('test', BATCH_SIZE, CONFIG['img_size'], CONFIG['map_size'], CONFIG['norms'], SEED)
 
-os.environ["CUDA_VISIBLE_DEVICES"] = str(opt.gpu)
-torch.manual_seed(opt.seed)
-torch.cuda.manual_seed_all(opt.seed)
+DATA_TEST = None
 
-#################################################################################################################
-class DATA(object):
-    def __init__(self, data_root, image_width=299, image_height=299):
-        self.data_root = data_root
-        self.image_width = image_width
-        self.image_height = image_height
+TEMPLATES = None
+if MAPTYPE in ['tmp', 'pca_tmp']:
+  TEMPLATES = get_templates()
 
-        # self.transform = transforms.Compose([
-        #     transforms.ToPILImage(),
-        #     transforms.Resize((image_width, image_height)),
-        #     transforms.ToTensor(),
-        #     transforms.Normalize([0.5] * 3, [0.5] * 3)
-        # ])
-        self.transform = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        self.classes = {'Real': 0, 'Fake': 1}
-        self.img_paths = []
+MODEL_NAME = '{0}_{1}'.format(BACKBONE, MAPTYPE)
+MODEL_DIR = MODEL_DIR + MODEL_NAME + '/'
 
-        for f in self.classes.items():
-            file_names = os.listdir(os.path.join(self.data_root, f[0]))
-            for file_name in file_names:
-                self.img_paths.append((os.path.join(f[0], file_name), f[1]))
+MODEL = Model(MAPTYPE, TEMPLATES, 2, False)
 
-    def __getitem__(self, index):
-        fname = self.img_paths[index][0]
-        image_path = os.path.join(self.data_root, fname)
-        image = imread(image_path)
-        image = self.transform(image)
-        label = self.img_paths[index][1]
-        return fname, image, label
+OPTIM = optim.Adam(MODEL.model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+MODEL.model.cuda()
+LOSS_CSE = nn.CrossEntropyLoss().cuda()
+LOSS_L1 = nn.L1Loss().cuda()
+MAXPOOL = nn.MaxPool2d(19).cuda()
 
-    def __len__(self):
-        return len(self.img_paths)
+def calculate_losses(batch):
+  img = batch['img']
+  msk = batch['msk']
+  lab = batch['lab']
+  x, mask, vec = MODEL.model(img)
+  loss_l1 = LOSS_L1(mask, msk)
+  loss_cse = LOSS_CSE(x, lab)
+  loss = loss_l1 + loss_cse
+  pred = torch.max(x, dim=1)[1]
+  acc = (pred == lab).float().mean()
+  res = { 'lab': lab, 'msk': msk, 'score': x, 'pred': pred, 'mask': mask }
+  results = {}
+  for r in res:
+    results[r] = res[r].squeeze().cpu().numpy()
+  return { 'loss': loss, 'loss_l1': loss_l1, 'loss_cse': loss_cse, 'acc': acc }, results
 
+def process_batch(batch, mode):
+  MODEL.model.eval()
+  with torch.no_grad():
+    losses, results = calculate_losses(batch)
+  return losses, results
 
-print("Initializing Data Loader")
-data = DATA(data_root=(opt.data_dir + 'test/'))
-loader = DataLoader(data, num_workers=8, batch_size=opt.batch_size, shuffle=False, drop_last=False, pin_memory=True)
+def run_step(di, e, s, resultdir):
+  batch = DATA_TEST.get_batch(di)
+  if batch is None:
+    return True
+  losses, results = process_batch(batch, 'test')
 
+  savemat('{0}{1}_{2}.mat'.format(resultdir, di, s), results)
 
-print("Initializing Networks")
-# model_xcp = xception(2)
-# checkpoint = torch.load(opt.modeldir)
-# model_xcp.load_state_dict(checkpoint['module'])
-# model_xcp.eval().cuda()
+  if s % 10 == 0:
+    print('\r{0} - '.format(s) + ', '.join(['{0}: {1:.3f}'.format(_, losses[_].cpu().detach().numpy()) for _ in losses]), end='')
+  return False
 
-model_vgg = vgg16()
-checkpoint = torch.load(opt.modeldir)
-model_vgg.load_state_dict(checkpoint['module'])
-model_vgg.eval().cuda()
+def run_epoch(di, e, resultdir):
+  s = 0
+  while True:
+    s += 1
+    is_done = run_step(di, e, s, resultdir)
+    if is_done:
+      break
 
-softmax = nn.Softmax(dim=1)
-def test(image):
-    with torch.no_grad():
-        z = model_vgg(image)
-        pred = torch.max(z, dim=1)[1]
-        z = softmax(z)
-    return pred, z
+LAST_EPOCH = 75
+for e in range(LAST_EPOCH, MAX_EPOCHS, 5):
+  resultdir = '{0}results/{1}/'.format(MODEL_DIR, e)
+  if os.path.exists(resultdir):
+    shutil.rmtree(resultdir)
+  os.makedirs(resultdir, exist_ok=True)
+  MODEL.load(e, MODEL_DIR)
+  DATA_TEST = get_dataset()
+  for di, d in enumerate(DATA_TEST.datasets):
+    run_epoch(di, e, resultdir)
+  print()
 
-
-scores = []
-preds = []
-labels = []
-for iteration, batch in enumerate(loader):
-    fname, image, label = batch[0], batch[1].cuda(), batch[2].cuda()
-    print("Iteration: " + str(iteration))
-    pred, score = test(image)
-    scores.extend(score.select(1, 1).tolist())
-    preds.extend(pred.tolist())
-    labels.extend(label.tolist())
-
-print(scores)
-print(preds)
-print(labels)
-pickle.dump([scores, preds, labels], open( "vgg_base.pickle", "wb" ) )
-acc = accuracy_score(labels, preds)
-fpr, tpr, thresholds = metrics.roc_curve(labels, scores, drop_intermediate=False)
-print(fpr)
-print(tpr)
-fnr = 1 - tpr
-eer = fnr[np.nanargmin(np.absolute((fnr - fpr)))]
-tpr_0_01 = -1
-tpr_0_02 = -1
-tpr_0_05 = -1
-tpr_0_10 = -1
-tpr_0_20 = -1
-tpr_0_50 = -1
-tpr_1_00 = -1
-tpr_2_00 = -1
-tpr_5_00 = -1
-for i in range(len(fpr)):
-    if fpr[i] > 0.0001 and tpr_0_01 == -1:
-        tpr_0_01 = tpr[i-1]
-    if fpr[i] > 0.0002 and tpr_0_02 == -1:
-        tpr_0_02 = tpr[i-1]
-    if fpr[i] > 0.0005 and tpr_0_05 == -1:
-        tpr_0_05 = tpr[i-1]
-    if fpr[i] > 0.001 and tpr_0_10 == -1:
-        tpr_0_10 = tpr[i-1]
-    if fpr[i] > 0.002 and tpr_0_20 == -1:
-        tpr_0_20 = tpr[i-1]
-    if fpr[i] > 0.005 and tpr_0_50 == -1:
-        tpr_0_50 = tpr[i-1]
-    if fpr[i] > 0.01 and tpr_1_00 == -1:
-        tpr_1_00 = tpr[i-1]
-    if fpr[i] > 0.02 and tpr_2_00 == -1:
-        tpr_2_00 = tpr[i-1]
-    if fpr[i] > 0.05 and tpr_5_00 == -1:
-        tpr_5_00 = tpr[i-1]
-
-roc_auc = auc(fpr, tpr)
-plt.plot(fpr, tpr, lw=1, alpha=0.3,
-         label='ROC fold (AUC = %0.2f)' % (roc_auc))
-print("ACC: {:f}\nAUC: {:f}\nEER: {:f}\nTPR@0.01: {:f}\nTPR@0.10: {:f}\nTPR@1.00: {:f}".format(acc, roc_auc, eer, tpr_0_01, tpr_0_10, tpr_1_00))
-
-plt.xlim([-0.05, 1.05])
-plt.ylim([-0.05, 1.05])
-plt.xlabel('False Positive Rate')
-plt.ylabel('True Positive Rate')
-plt.title('Receiver operating characteristic example')
-plt.legend(loc="lower right")
-plt.show()
+print('Testing complete')

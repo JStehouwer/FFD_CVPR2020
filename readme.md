@@ -17,7 +17,7 @@ This code is provided as example code, and may not reflect a specific combinatio
 
 ### Description of contents
 
-- `network/`: Contains files that define the VGG and Xception networks with the attention mechanism
+- `xception.py`: Defines the Xception network with the attention mechanism
 - `train*.py`: Train the model on the train data
 - `test*.py`: Evaluate the model on the test data
 

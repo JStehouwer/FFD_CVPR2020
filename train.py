@@ -1,154 +1,113 @@
-import argparse
-import datetime
 import numpy as np
 import os
 import random
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from imageio import imread
-from network.xception import xception
 from tensorboardX import SummaryWriter
-from torchvision import transforms
-from torch.utils.data import DataLoader
+import torch
+import torch.optim as optim
+import torch.nn as nn
+
+from dataset import Dataset
+from templates import get_templates
+
+MODEL_DIR = './models/'
+BACKBONE = 'xcp'
+MAPTYPE = 'reg'
+BATCH_SIZE = 15
+MAX_EPOCHS = 100
+STEPS_PER_EPOCH = 1000
+LEARNING_RATE = 0.0001
+WEIGHT_DECAY = 0.001
+
+CONFIGS = {
+  'xcp': {
+          'img_size': (299, 299),
+          'map_size': (19, 19),
+          'norms': [[0.5] * 3, [0.5] * 3]
+         },
+  'vgg': {
+          'img_size': (299, 299),
+          'map_size': (19, 19),
+          'norms': [[0.485, 0.456, 0.406], [0.229, 0.224, 0.225]]
+         }
+}
+CONFIG = CONFIGS[BACKBONE]
+
+if BACKBONE == 'xcp':
+  from xception import Model
+elif BACKBONE == 'vgg':
+  from vgg import Model
+
 torch.backends.deterministic = True
+SEED = 1
+random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--gpu', type=int, default=0)
-parser.add_argument('--batch_size', type=int, default=1, help='batch size')
-parser.add_argument('--lr', type=float, default=0.0002, help='learning rate')
-parser.add_argument('--seed', type=int, default=1, help='manual seed')
-parser.add_argument('--it_start', type=int, default=1, help='number of itr to start with')
-parser.add_argument('--it_end', type=int, default=10000, help='number of itr to end with')
-parser.add_argument('--signature', default=str(datetime.datetime.now()))
-parser.add_argument('--data_dir', help='directory for data')
-parser.add_argument('--save_dir', default='./runs', help='directory for result')
-opt = parser.parse_args()
-print(opt)
+DATA_TRAIN = Dataset('train', BATCH_SIZE, CONFIG['img_size'], CONFIG['map_size'], CONFIG['norms'], SEED)
 
-sig = str(datetime.datetime.now()) + opt.signature
-os.environ["CUDA_VISIBLE_DEVICES"] = str(opt.gpu)
-random.seed(opt.seed)
-torch.manual_seed(opt.seed)
-torch.cuda.manual_seed_all(opt.seed)
-os.makedirs('%s/modules/%s' % (opt.save_dir, sig), exist_ok=True)
+DATA_EVAL = Dataset('eval', BATCH_SIZE, CONFIG['img_size'], CONFIG['map_size'], CONFIG['norms'], SEED)
 
+TEMPLATES = None
+if MAPTYPE in ['tmp', 'pca_tmp']:
+  TEMPLATES = get_templates()
 
-class DATA(object):
-    def __init__(self, data_root, image_width=299, image_height=299, seed=opt.seed):
+MODEL_NAME = '{0}_{1}'.format(BACKBONE, MAPTYPE)
+MODEL_DIR = MODEL_DIR + MODEL_NAME + '/'
 
-        np.random.seed(seed)
-        self.data_root = data_root
-        self.image_width = image_width
-        self.image_height = image_height
+MODEL = Model(MAPTYPE, TEMPLATES, 2, False)
 
-        self.transform = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.Resize((image_width, image_height)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5] * 3, [0.5] * 3)
-        ])
+OPTIM = optim.Adam(MODEL.model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+MODEL.model.cuda()
+LOSS_CSE = nn.CrossEntropyLoss().cuda()
+LOSS_L1 = nn.L1Loss().cuda()
+MAXPOOL = nn.MaxPool2d(19).cuda()
 
-        self.classes = {'Real': 0, 'Fake_Entire': 1, 'Fake_Partial': 2}
-        self.img_paths = {'Real': [], 'Fake_Entire': [], 'Fake_Partial': []}
+def calculate_losses(batch):
+  img = batch['img']
+  msk = batch['msk']
+  lab = batch['lab']
+  x, mask, vec = MODEL.model(img)
+  loss_l1 = LOSS_L1(mask, msk)
+  loss_cse = LOSS_CSE(x, lab)
+  loss = loss_l1 + loss_cse
+  pred = torch.max(x, dim=1)[1]
+  acc = (pred == lab).float().mean()
+  return { 'loss': loss, 'loss_l1': loss_l1, 'loss_cse': loss_cse, 'acc': acc }
 
-        for f in self.classes.items():
-            file_names = os.listdir(os.path.join(self.data_root, f[0]))
-            for file_name in file_names:
-                self.img_paths[f[0]].append((os.path.join(f[0], file_name), f[1]))
-
-        for f in self.img_paths.values():
-            random.Random(seed).shuffle(f)
-
-    def load_img(self, path):
-        img = imread(path)
-        img = self.transform(img)
-        return img
-
-    def __getitem__(self, index):
-        random_folder = random.choice(list(self.classes.keys()))
-        label = self.classes[random_folder]
-
-        image_path = os.path.join(self.data_root, random.choice(self.img_paths[random_folder])[0])
-        img = self.load_img(image_path)
-
-        return img, label
-
-    def __len__(self):
-        return sum([len(i) for i in self.img_paths.values()])
-
-
-def get_training_batch(data_loader):
-    while True:
-        for sequence in data_loader:
-            batch = sequence[0].cuda(), sequence[1].cuda()
-            yield batch
-
-
-print("Initializing Data Loader")
-train_data = DATA(data_root=(opt.data_dir + 'train/'))
-train_loader = DataLoader(train_data, num_workers=8, batch_size=opt.batch_size, shuffle=True, drop_last=True, pin_memory=True)
-training_batch_generator = get_training_batch(train_loader)
-
-test_data = DATA(data_root=(opt.data_dir + 'validation/'))
-test_loader = DataLoader(test_data, num_workers=8, batch_size=opt.batch_size, shuffle=True, drop_last=True, pin_memory=True)
-testing_batch_generator = get_training_batch(test_loader)
-
-
-print("Initializing Networks")
-model_xcp = xception(len(train_data.classes), load_pretrain=True)
-optimizer_xcp = optim.Adam(model_xcp.parameters(), lr=opt.lr)
-model_xcp.cuda()
-cse_loss = nn.CrossEntropyLoss().cuda()
-
-
-def train_xcp(batch, label):
-    model_xcp.train()
-    y = model_xcp(batch)
-    loss = cse_loss(y, label)
-    optimizer_xcp.zero_grad()
-    loss.backward()
-    optimizer_xcp.step()
-    return[loss.item()]
-
-
-def test(batch, label):
-    model_xcp.eval()
+def process_batch(batch, mode):
+  if mode == 'train':
+    MODEL.model.train()
+    losses = calculate_losses(batch)
+    OPTIM.zero_grad()
+    losses['loss'].backward()
+    OPTIM.step()
+  elif mode == 'eval':
+    MODEL.model.eval()
     with torch.no_grad():
-        n = model_xcp(batch)
-        loss = cse_loss(n, label)
-        prediction = torch.max(n, dim=1)[1]
-        accu = (prediction.eq(label.long())).sum()
-    return [loss.item(), accu.item()/len(batch)]
+      losses = calculate_losses(batch)
+  return losses
 
+SUMMARY_WRITER = SummaryWriter(MODEL_DIR + 'logs/')
+def write_tfboard(item, itr, name):
+  SUMMARY_WRITER.add_scalar('{0}'.format(name), item, itr)
 
-def write_tfboard(vals, itr, name):
-    for idx, item in enumerate(vals):
-        writer.add_scalar('data/%s%d' % (name, idx), item, itr)
+def run_step(e, s):
+  batch = DATA_TRAIN.get_batch()
+  losses = process_batch(batch, 'train')
 
+  if s % 10 == 0:
+    print('\r{0} - '.format(s) + ', '.join(['{0}: {1:.3f}'.format(_, losses[_].cpu().detach().numpy()) for _ in losses]), end='')
+  if s % 100 == 0:
+    print('\n', end='')
+    [write_tfboard(losses[_], e * STEPS_PER_EPOCH + s, _) for _ in losses]
 
-writer = SummaryWriter('%s/logs/%s' % (opt.save_dir, sig))
+def run_epoch(e):
+  print('Epoch: {0}'.format(e))
+  for s in range(STEPS_PER_EPOCH):
+    run_step(e, s)
+  MODEL.save(e+1, OPTIM, MODEL_DIR)
 
-print("Start Training")
-itr = opt.it_start
-while itr != opt.it_end+1:
-    batch_train, lb_train = next(training_batch_generator)
-    loss = train_xcp(batch_train, lb_train)
-    write_tfboard([loss[0]], itr, name='TRAIN')
+LAST_EPOCH = 0
+for e in range(LAST_EPOCH, MAX_EPOCHS):
+  run_epoch(e)
 
-    if itr % 100 == 0:
-        test_results = [0,0]
-        for i in range(5):
-            batch_test, lb_test = next(testing_batch_generator)
-            a, b = test(batch_test, lb_test)
-            test_results[0] += a
-            test_results[1] += b
-        test_results[0] /= 5
-        test_results[1] /= 5
-        write_tfboard(test_results, itr, name='TEST')
-        print("Eval: " + str(itr))
-    if itr % 1000 == 0:
-        torch.save({'module': model_xcp.state_dict()}, '%s/modules/%s/%d.pickle' % (opt.save_dir, sig, itr))
-        print("Save Model: {:d}".format(itr))
-
-    itr += 1

@@ -1,2 +1,3 @@
 __pycache__/
-network/xception-b5690688.pth
+models/
+xception-b5690688.pth
