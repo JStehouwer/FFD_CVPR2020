@@ -163,7 +163,7 @@ class Xception(nn.Module):
     elif maptype == 'reg':
       self.map = RegressionMap(728)
     elif maptype == 'tmp':
-      self.map = TemplateMap(728)
+      self.map = TemplateMap(728, templates)
     elif maptype == 'pca_tmp':
       self.map = PCATemplateMap(728)
     else:

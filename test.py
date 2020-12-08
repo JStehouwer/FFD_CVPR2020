@@ -3,7 +3,6 @@ import os
 import random
 from scipy.io import savemat
 import shutil
-from tensorboardX import SummaryWriter
 import torch
 import torch.optim as optim
 import torch.nn as nn
@@ -13,11 +12,9 @@ from templates import get_templates
 
 MODEL_DIR = './models/'
 BACKBONE = 'xcp'
-MAPTYPE = 'reg'
+MAPTYPE = 'tmp'
 BATCH_SIZE = 200
 MAX_EPOCHS = 100
-LEARNING_RATE = 0.0001
-WEIGHT_DECAY = 0.001
 
 CONFIGS = {
   'xcp': {
@@ -58,7 +55,6 @@ MODEL_DIR = MODEL_DIR + MODEL_NAME + '/'
 
 MODEL = Model(MAPTYPE, TEMPLATES, 2, False)
 
-OPTIM = optim.Adam(MODEL.model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 MODEL.model.cuda()
 LOSS_CSE = nn.CrossEntropyLoss().cuda()
 LOSS_L1 = nn.L1Loss().cuda()

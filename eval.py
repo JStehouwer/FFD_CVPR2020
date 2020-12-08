@@ -6,7 +6,7 @@ from sklearn import metrics
 from sklearn.metrics import auc
 
 EPOCH = '80'
-RESDIR = './models/xcp_reg/results/' + EPOCH + '/'
+RESDIR = './models/xcp_tmp/results/' + EPOCH + '/'
 RESFILENAMES = glob.glob(RESDIR + '*.mat')
 MASK_THRESHOLD = 0.5
 

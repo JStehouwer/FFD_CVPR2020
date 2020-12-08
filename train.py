@@ -11,7 +11,7 @@ from templates import get_templates
 
 MODEL_DIR = './models/'
 BACKBONE = 'xcp'
-MAPTYPE = 'reg'
+MAPTYPE = 'tmp'
 BATCH_SIZE = 15
 MAX_EPOCHS = 100
 STEPS_PER_EPOCH = 1000
